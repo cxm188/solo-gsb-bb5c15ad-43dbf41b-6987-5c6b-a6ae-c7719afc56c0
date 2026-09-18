@@ -1,9 +1,10 @@
 # iCalendar Recurrence Expansion & Availability API
 
 A local HTTP API that expands iCalendar (RFC 5545) recurring events into
-concrete UTC instances inside a query window, and finds the **common free
+concrete UTC instances inside a query window, finds the **common free
 time** across several named calendars when intersected with per-weekday
-local working hours.
+local working hours, and **validates** `VEVENT` structure with per-event
+diagnostics.
 
 - Expands `DTSTART` + `RRULE` + `RDATE` − `EXDATE`
 - Merges overrides by `UID` + `RECURRENCE-ID`: an override can **reschedule**
@@ -27,6 +28,10 @@ local working hours.
   override that declares any `ATTENDEE` replaces the whole list (one
   without keeps inheriting), with `PARTSTAT` counts and stable address
   ordering
+- `/validate` checks every `VEVENT` in document order (missing
+  `UID`/`DTSTART`, `DTEND`+`DURATION` together, end not after start,
+  duplicate masters, orphan overrides) and always answers `200` with
+  structured per-event issues — even for unparsable input
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -609,6 +614,82 @@ therefore replaces the entire list; `counts` follows each effective list:
 }
 ```
 
+### `POST /validate`
+
+Checks every `VEVENT` in the supplied calendar **in document order** and
+returns structured diagnostics. Unlike the other endpoints, validation is
+total: the response is always `200`, even when the iCalendar text cannot
+be parsed at all. Request body:
+
+| Field | Type   | Description                        |
+| ----- | ------ | ---------------------------------- |
+| `ics` | string | iCalendar text (one `VCALENDAR`)   |
+
+The response carries `valid` (`true` only when there are no issues),
+`error_count` (the number of issues), and `issues`. Each issue has a
+stable machine-readable `code`, a human-readable `message`, the
+`event_index` of the offending `VEVENT` (its 0-based position among the
+document's `VEVENT`s; `null` when the issue cannot be located, e.g. a
+parse failure), and the event's `uid` (`null` when it has none). Issues
+are sorted by `event_index` (`null` first), then `code`, and one event
+may accumulate several issues. The possible codes:
+
+| Code                 | Meaning                                                                                          |
+| -------------------- | ------------------------------------------------------------------------------------------------ |
+| `PARSE_ERROR`        | The iCalendar text could not be parsed (`event_index` and `uid` are `null`)                      |
+| `MISSING_UID`        | The `VEVENT` has no `UID` property                                                               |
+| `MISSING_DTSTART`    | The `VEVENT` has no `DTSTART` property                                                           |
+| `DTEND_AND_DURATION` | The `VEVENT` declares both `DTEND` and `DURATION` (RFC 5545 allows only one)                     |
+| `END_NOT_AFTER_START` | The event ends at or before its start (checked only when `DTSTART` and `DTEND`/`DURATION` are usable) |
+| `DUPLICATE_MASTER`   | More than one master `VEVENT` (no `RECURRENCE-ID`) shares the UID; every master after the first is flagged |
+| `ORPHAN_OVERRIDE`    | A `RECURRENCE-ID` override whose UID has no master `VEVENT` anywhere in the document             |
+
+A `VEVENT` without `DTEND`/`DURATION` is a valid zero-duration event and
+is *not* flagged; `END_NOT_AFTER_START` compares start and end normalized
+to UTC (so a `TZID` end equal to a `Z` start is caught). Orphan detection
+considers the whole document: a master appearing after its override still
+counts.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:dup\r\nDTSTART:20260301T090000Z\r\nDTEND:20260301T090000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:dup\r\nDTSTART:20260302T090000Z\r\nDTEND:20260302T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:ghost\r\nRECURRENCE-ID:20260303T090000Z\r\nDTSTART:20260303T110000Z\r\nDTEND:20260303T120000Z\r\nEND:VEVENT\r\nEND:VCALENDAR"
+  }'
+```
+
+The first event ends exactly when it starts, the second is a duplicate
+master for `dup`, and the third overrides a series that has no master:
+
+```json
+{
+  "valid": false,
+  "error_count": 3,
+  "issues": [
+    {
+      "code": "END_NOT_AFTER_START",
+      "message": "VEVENT end 2026-03-01T09:00:00Z is not after its start 2026-03-01T09:00:00Z",
+      "event_index": 0,
+      "uid": "dup"
+    },
+    {
+      "code": "DUPLICATE_MASTER",
+      "message": "duplicate master VEVENT for UID 'dup' (first master at event index 0)",
+      "event_index": 1,
+      "uid": "dup"
+    },
+    {
+      "code": "ORPHAN_OVERRIDE",
+      "message": "override VEVENT for UID 'ghost' has no matching master (no VEVENT without RECURRENCE-ID for this UID)",
+      "event_index": 2,
+      "uid": "ghost"
+    }
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -651,6 +732,11 @@ omitted parameter). Every `VEVENT`'s own `ATTENDEE` list is validated
 eagerly, so a conflict yields `422` even for events outside the window.
 Calendar-level failures (unparsable ICS, bad window, invalid recurrence,
 unknown `TZID`) reuse the `/expand` checks.
+
+`/validate` is the exception to the `422` contract: it reports every
+problem — including unparsable iCalendar text — as a `200` response with
+structured `issues`, and only a malformed request body (e.g. a missing
+`ics` field) yields a `422`.
 
 ## Semantics and limitations
 
@@ -770,13 +856,15 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ```
 app/main.py          FastAPI app: POST /expand, POST /alarms,
                      POST /attendance, POST /calendar-diff,
-                     POST /availability, POST /conflicts, GET /health
+                     POST /availability, POST /conflicts,
+                     POST /validate, GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/attendance.py    ATTENDEE inheritance, address normalization, PARTSTAT counts
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID
 app/availability.py  working-period timeline, busy clipping/merge, free complement
 app/conflicts.py     half-open sweep for minimum-concurrency segments
+app/validator.py     per-VEVENT structural checks with stable issue codes
 tests/               key tests for all endpoints (recurrences, DST, 422s)
 Dockerfile           python:3.12-slim image running uvicorn on port 8000
 docker-compose.yml   single-command startup

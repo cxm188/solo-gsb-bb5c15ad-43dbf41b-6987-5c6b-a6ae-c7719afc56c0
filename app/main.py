@@ -25,17 +25,19 @@ from .availability import (
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
+from .validator import Issue, validate_calendar
 
 UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.5.0",
+    version="1.6.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
-    "segments across named calendars, expand VALARM reminders, and report "
-    "per-instance ATTENDEE participation status inside a query window.",
+    "segments across named calendars, expand VALARM reminders, report "
+    "per-instance ATTENDEE participation status inside a query window, "
+    "and validate VEVENT structure with per-event diagnostics.",
 )
 
 
@@ -406,6 +408,28 @@ class CalendarDiffResponse(BaseModel):
         return _iso_z(value)
 
 
+# ---------------------------------------------------------------------------
+# POST /validate
+# ---------------------------------------------------------------------------
+
+
+class ValidateRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to validate")
+
+
+class IssueOut(BaseModel):
+    code: str
+    message: str
+    event_index: int | None
+    uid: str | None
+
+
+class ValidateResponse(BaseModel):
+    valid: bool
+    error_count: int
+    issues: list[IssueOut]
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
@@ -573,5 +597,25 @@ def conflicts(request: ConflictsRequest) -> ConflictsResponse:
                 participants=[_participant_out(p) for p in segment.participants],
             )
             for segment in segments
+        ],
+    )
+
+
+@app.post("/validate", response_model=ValidateResponse)
+def validate(request: ValidateRequest) -> ValidateResponse:
+    # Validation is total: even unparsable input gets a 200 with
+    # structured diagnostics (a PARSE_ERROR issue), never a 422.
+    issues: list[Issue] = validate_calendar(request.ics)
+    return ValidateResponse(
+        valid=not issues,
+        error_count=len(issues),
+        issues=[
+            IssueOut(
+                code=issue.code,
+                message=issue.message,
+                event_index=issue.event_index,
+                uid=issue.uid,
+            )
+            for issue in issues
         ],
     )
