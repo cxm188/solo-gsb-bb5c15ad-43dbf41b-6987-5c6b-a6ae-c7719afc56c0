@@ -27,6 +27,10 @@ local working hours.
   override that declares any `ATTENDEE` replaces the whole list (one
   without keeps inheriting), with `PARTSTAT` counts and stable address
   ordering
+- `/validate` structurally checks raw iCalendar text and always replies
+  `200` — even unparsable input — with a sorted list of stable-coded
+  diagnostics (missing `UID`/`DTSTART`, `DTEND` + `DURATION`, inverted
+  times, duplicate master events, orphan overrides)
 - Results sorted by UTC start time, then `UID` (stable)
 - Clear `422` errors for invalid rules, unknown timezones, or bad input
 
@@ -609,6 +613,121 @@ therefore replaces the entire list; `counts` follows each effective list:
 }
 ```
 
+### `POST /validate`
+
+Structurally validates iCalendar text and reports every problem found as a
+diagnostic — **without any query window**. Unlike the other endpoints,
+validation never fails a request for bad calendar content: both valid and
+invalid calendars return `200`, and even text that cannot be parsed yields a
+structured issue rather than an error status.
+
+| Field | Type   | Description                            |
+| ----- | ------ | -------------------------------------- |
+| `ics` | string | iCalendar text (zero or more `VEVENT`s) |
+
+The response is:
+
+| Field         | Type    | Description                                                |
+| ------------- | ------- | ---------------------------------------------------------- |
+| `valid`       | boolean | `true` only when there are no issues                       |
+| `error_count` | integer | Number of issues (`issues.length`)                         |
+| `issues`      | array   | Diagnostics sorted by `event_index` (nulls first), `code`  |
+
+Each issue carries:
+
+| Field         | Type           | Description                                                       |
+| ------------- | -------------- | ----------------------------------------------------------------- |
+| `code`        | string         | Stable machine-readable code (see below)                          |
+| `message`     | string         | Human-readable description                                        |
+| `event_index` | integer \| null | 0-based index of the offending `VEVENT` in source order; `null` when no event can be located |
+| `uid`         | string \| null  | The event's `UID`; `null` when the event has no usable UID        |
+
+The checks run per `VEVENT`, in the order the events appear in the source
+text; a single event can accumulate several issues. Cross-event checks run
+afterwards. The stable codes are:
+
+| Code                     | Meaning                                                                          |
+| ------------------------ | -------------------------------------------------------------------------------- |
+| `parse_error`            | The text could not be parsed as iCalendar at all (`event_index`/`uid` are null); no further checks are possible |
+| `missing_uid`            | A `VEVENT` lacks the required `UID` property                                     |
+| `missing_dtstart`        | A `VEVENT` lacks `DTSTART`, or its `DTSTART` is not a valid DATE/DATE-TIME value |
+| `dtend_and_duration`     | A `VEVENT` declares both `DTEND` and `DURATION`, which RFC 5545 forbids          |
+| `end_before_start`       | The declared end (`DTEND`, or `DTSTART + DURATION`) is equal to or earlier than the start, after normalization to UTC |
+| `duplicate_master_event` | More than one `VEVENT` with the same `UID` has no `RECURRENCE-ID`; every such master is flagged |
+| `orphan_override`        | A `VEVENT` with `RECURRENCE-ID` has no master event (a same-`UID` `VEVENT` without `RECURRENCE-ID`) |
+
+Notes on semantics:
+
+- Floating (timezone-less) values are assumed UTC, as on the other
+  endpoints, so cross-timezone comparisons are correct (including DST);
+  `DATE`-valued starts count as midnight UTC and a one-day all-day event
+  has a next-day `DTEND`.
+- An event with only `DTSTART` (zero-duration) is not flagged; only an
+  *explicitly declared* end is order-checked. When `DTSTART` is unusable
+  the ordering check is skipped (the `missing_dtstart` issue stands
+  instead).
+- Events without a usable `UID` take part only in the per-event checks;
+  they can neither count as masters nor bind overrides.
+- When both `DTEND` and `DURATION` are present, `DTEND` is still used for
+  the ordering check, so an inverted event may report both
+  `dtend_and_duration` and `end_before_start`.
+- A missing `ics` request field is a normal schema failure (`422`); every
+  well-formed request, even with garbage `ics`, gets `200`.
+
+### Example
+
+```bash
+curl -s http://localhost:8000/validate \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "ics": "BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//demo//EN\r\nBEGIN:VEVENT\r\nUID:series\r\nDTSTART:20260105T090000Z\r\nDURATION:PT1H\r\nRRULE:FREQ=WEEKLY;COUNT=3\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series\r\nDTSTART:20260106T090000Z\r\nDTEND:20260106T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nUID:series\r\nRECURRENCE-ID:20260120T090000Z\r\nDTSTART:20260120T110000Z\r\nDTEND:20260120T100000Z\r\nEND:VEVENT\r\nBEGIN:VEVENT\r\nDTSTART:20260121T090000Z\r\nDTEND:20260121T080000Z\r\nEND:VEVENT\r\nEND:VCALENDAR"
+  }'
+```
+
+The second event is a second master for `UID:series` (both masters are
+flagged); the override's end precedes its start; the last event is missing
+its `UID` and also inverted. Issues come back ordered by event index and
+then code:
+
+```json
+{
+  "valid": false,
+  "error_count": 5,
+  "issues": [
+    {
+      "code": "duplicate_master_event",
+      "message": "UID 'series' has 2 VEVENTs without RECURRENCE-ID; a recurring series may have only one master event",
+      "event_index": 0,
+      "uid": "series"
+    },
+    {
+      "code": "duplicate_master_event",
+      "message": "UID 'series' has 2 VEVENTs without RECURRENCE-ID; a recurring series may have only one master event",
+      "event_index": 1,
+      "uid": "series"
+    },
+    {
+      "code": "end_before_start",
+      "message": "VEVENT end 2026-01-20T10:00:00Z is not later than its start 2026-01-20T11:00:00Z",
+      "event_index": 2,
+      "uid": "series"
+    },
+    {
+      "code": "end_before_start",
+      "message": "VEVENT end 2026-01-21T08:00:00Z is not later than its start 2026-01-21T09:00:00Z",
+      "event_index": 3,
+      "uid": null
+    },
+    {
+      "code": "missing_uid",
+      "message": "VEVENT is missing the required UID property",
+      "event_index": 3,
+      "uid": null
+    }
+  ]
+}
+```
+
 ### Errors (`422 Unprocessable Entity`)
 
 Returned with a descriptive `detail` message for: unparsable iCalendar
@@ -651,6 +770,12 @@ omitted parameter). Every `VEVENT`'s own `ATTENDEE` list is validated
 eagerly, so a conflict yields `422` even for events outside the window.
 Calendar-level failures (unparsable ICS, bad window, invalid recurrence,
 unknown `TZID`) reuse the `/expand` checks.
+
+`/validate` is the deliberate exception: it never returns `422` for
+calendar content. Unparsable text and malformed events are reported as
+`200` responses with one or more issues (a `parse_error` issue has null
+`event_index`/`uid`). The only `422` from `/validate` is a malformed
+request body (e.g. a missing `ics` field).
 
 ## Semantics and limitations
 
@@ -770,8 +895,10 @@ uvicorn app.main:app --reload       # run locally on port 8000
 ```
 app/main.py          FastAPI app: POST /expand, POST /alarms,
                      POST /attendance, POST /calendar-diff,
-                     POST /availability, POST /conflicts, GET /health
+                     POST /availability, POST /conflicts, POST /validate,
+                     GET /health
 app/expander.py      recurrence expansion, override merging, TZ/DST handling
+app/validation.py    structural VEVENT checks, stable issue codes, sorting
 app/alarms.py        VALARM parsing, REPEAT/DURATION fan-out, window filtering
 app/attendance.py    ATTENDEE inheritance, address normalization, PARTSTAT counts
 app/diff.py          two-calendar instance diff by UID + RECURRENCE-ID

@@ -25,17 +25,19 @@ from .availability import (
 from .conflicts import ConflictSegment, ConflictsError, Participant, find_conflicts
 from .diff import CalendarDiff, diff_calendars
 from .expander import ExpansionError, Instance, expand_calendar
+from .validation import Issue, validate_ics
 
 UTC = dt.timezone.utc
 
 app = FastAPI(
     title="iCalendar Recurrence Expansion and Availability API",
-    version="1.5.0",
+    version="1.6.0",
     summary="Expand DTSTART/RRULE/RDATE/EXDATE and RECURRENCE-ID overrides "
     "into concrete UTC instances, intersect named calendars with "
     "local working hours to find common free time, find high-concurrency "
-    "segments across named calendars, expand VALARM reminders, and report "
-    "per-instance ATTENDEE participation status inside a query window.",
+    "segments across named calendars, expand VALARM reminders, report "
+    "per-instance ATTENDEE participation status inside a query window, and "
+    "validate raw iCalendar text structurally.",
 )
 
 
@@ -371,6 +373,15 @@ def _participant_out(participant: Participant) -> ParticipantOut:
     )
 
 
+def _issue_out(issue: Issue) -> IssueOut:
+    return IssueOut(
+        code=issue.code,
+        message=issue.message,
+        event_index=issue.event_index,
+        uid=issue.uid,
+    )
+
+
 # ---------------------------------------------------------------------------
 # POST /calendar-diff
 # ---------------------------------------------------------------------------
@@ -406,9 +417,46 @@ class CalendarDiffResponse(BaseModel):
         return _iso_z(value)
 
 
+# ---------------------------------------------------------------------------
+# POST /validate
+# ---------------------------------------------------------------------------
+
+
+class ValidateRequest(BaseModel):
+    ics: str = Field(..., description="iCalendar (RFC 5545) text to validate")
+
+
+class IssueOut(BaseModel):
+    code: str = Field(..., description="Stable machine-readable issue code")
+    message: str = Field(..., description="Human-readable diagnostic")
+    event_index: int | None = Field(
+        None,
+        description="0-based index of the offending VEVENT in source order; "
+        "null when no event can be located",
+    )
+    uid: str | None = Field(None, description="UID of the offending event, if any")
+
+
+class ValidateResponse(BaseModel):
+    valid: bool
+    error_count: int
+    issues: list[IssueOut]
+
+
 @app.get("/health")
 def health() -> dict:
     return {"status": "ok"}
+
+
+@app.post("/validate", response_model=ValidateResponse)
+def validate(request: ValidateRequest) -> ValidateResponse:
+    # Validation is diagnostic: even unparsable text yields 200 with issues.
+    report = validate_ics(request.ics)
+    return ValidateResponse(
+        valid=report.valid,
+        error_count=report.error_count,
+        issues=[_issue_out(issue) for issue in report.issues],
+    )
 
 
 @app.post("/expand", response_model=ExpandResponse)
